@@ -1,0 +1,11 @@
+Below are frameworks and playbooks that I use to guide my work and my relationships.
+
+### SMART Goals
+
+SMART is a framework for ensuring a goal is well stated.
+
+* Specific
+* Measurable
+* Actionable
+* Relevant
+* Time-Bound
