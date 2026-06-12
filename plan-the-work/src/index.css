@@ -135,3 +135,4 @@ a:hover { text-decoration: underline; }
 .note-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text2); }
 .text-muted { color: var(--text3); }
 .section-title { font-size: 14px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
+@keyframes spin { to { transform: rotate(360deg); } }

@@ -1,6 +1,200 @@
-import { useState, useEffect } from 'react'
-import { LayoutDashboard, ListChecks, AlertTriangle, ChevronLeft, Plus, Pencil, Trash2, Search, ChevronDown, ChevronRight, ExternalLink, X } from 'lucide-react'
+import { useState, useEffect, useCallback } from 'react'
+import { LayoutDashboard, ListChecks, AlertTriangle, ChevronLeft, Plus, Pencil, Trash2, Search, ChevronDown, ChevronRight, ExternalLink, X, Settings, RefreshCw, CheckCircle, XCircle, Loader } from 'lucide-react'
 import initialData from './data.json'
+
+// ─── Jira helpers ──────────────────────────────────────────────────────
+function useJiraConfig() {
+  const [cfg, setCfg] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('ptw_jira') || 'null') } catch { return null }
+  })
+  const save = c => { setCfg(c); localStorage.setItem('ptw_jira', JSON.stringify(c)) }
+  const clear = () => { setCfg(null); localStorage.removeItem('ptw_jira') }
+  return [cfg, save, clear]
+}
+
+function adfToText(doc) {
+  if (!doc) return ''
+  if (typeof doc === 'string') return doc
+  const walk = nodes => (nodes || []).flatMap(n => {
+    if (n.text) return [n.text]
+    if (n.content) return walk(n.content)
+    return []
+  })
+  return walk(doc.content || []).join('').trim()
+}
+
+const JIRA_STATUS_MAP = {
+  'To Do': 'To be Groomed', 'Backlog': 'To be Groomed', 'Open': 'To be Groomed',
+  'In Progress': 'In progress', 'In Review': 'In progress', 'In Development': 'In progress',
+  'Done': 'Completed', 'Closed': 'Completed', 'Resolved': 'Completed',
+  'Released': 'Released', 'Blocked': 'Blocked', 'Deferred': 'Deferred', 'On Hold': 'On Hold',
+}
+const JIRA_TASK_STATUS_MAP = {
+  'To Do': 'Planned', 'Open': 'Planned', 'Backlog': 'Planned',
+  'In Progress': 'In Progress', 'In Review': 'Code Review',
+  'Done': 'Done', 'Closed': 'Done', 'Released': 'Released',
+  'Blocked': 'Blocked', 'On Hold': 'On Hold',
+}
+
+function mapJiraToEpicFields(issue) {
+  const f = issue.fields
+  return {
+    project: f.summary || '',
+    status: JIRA_STATUS_MAP[f.status?.name] || f.status?.name || '',
+    deliveryOwner: f.assignee?.displayName || f.assignee?.emailAddress || '',
+    plannedReleaseDate: f.duedate || '',
+    generalComments: adfToText(f.description),
+    completionPct: f.status?.statusCategory?.key === 'done' ? 1 : undefined,
+  }
+}
+
+function mapJiraToTaskFields(issue) {
+  const f = issue.fields
+  const sprint = f.customfield_10020 || f.customfield_10014
+  const sprintName = Array.isArray(sprint) ? sprint[sprint.length - 1]?.name || '' : sprint?.name || ''
+  const pts = f.story_points ?? f.customfield_10016 ?? f.customfield_10028
+  return {
+    task: f.summary || '',
+    planningState: JIRA_TASK_STATUS_MAP[f.status?.name] || f.status?.name || 'Planned',
+    devOwner: f.assignee?.displayName || '',
+    estimatedReleaseDate: f.duedate || '',
+    sprintDev: sprintName,
+    devEstimates: pts != null ? String(pts) : '',
+  }
+}
+
+async function callJiraProxy(cfg, ticket) {
+  const res = await fetch('/api/jira', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ baseUrl: cfg.baseUrl, email: cfg.email, token: cfg.token, ticket }),
+  })
+  const data = await res.json()
+  if (!res.ok) throw new Error(data.errorMessages?.[0] || data.message || data.error || `HTTP ${res.status}`)
+  return data
+}
+
+function JiraFetchBtn({ ticket, onFetch, jiraCfg, mapFn }) {
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState(null)
+  const [ok, setOk] = useState(false)
+  const go = async () => {
+    if (!ticket || !jiraCfg) return
+    setLoading(true); setErr(null); setOk(false)
+    try {
+      const issue = await callJiraProxy(jiraCfg, ticket)
+      onFetch(mapFn(issue))
+      setOk(true); setTimeout(() => setOk(false), 2000)
+    } catch (e) { setErr(e.message) }
+    finally { setLoading(false) }
+  }
+  if (!jiraCfg) return <span style={{fontSize:11,color:'var(--text3)'}}>Configure Jira to auto-fill</span>
+  return (
+    <span style={{display:'inline-flex',alignItems:'center',gap:6}}>
+      <button className="btn btn-ghost btn-sm" onClick={go} disabled={!ticket || loading} style={{fontSize:11}}>
+        {loading ? <Loader size={11} style={{animation:'spin 1s linear infinite'}}/> : ok ? <CheckCircle size={11} color="var(--green)"/> : <RefreshCw size={11}/>}
+        {loading ? ' Fetching…' : ok ? ' Done' : ' Fetch from Jira'}
+      </button>
+      {err && <span style={{fontSize:11,color:'var(--red)',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={err}>{err}</span>}
+    </span>
+  )
+}
+
+// ─── Jira Settings Page ─────────────────────────────────────────────────
+function JiraSettingsPage({ jiraCfg, saveJiraCfg, clearJiraCfg }) {
+  const blank = { baseUrl: '', email: '', token: '' }
+  const [f, setF] = useState(jiraCfg || blank)
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState(null)
+  const set = k => e => setF(p => ({ ...p, [k]: e.target.value }))
+
+  const test = async () => {
+    setTesting(true); setTestResult(null)
+    try {
+      const isCloud = f.baseUrl.includes('atlassian.net')
+      const v = isCloud ? '3' : '2'
+      const url = `${f.baseUrl.replace(/\/$/, '')}/rest/api/${v}/myself`
+      const auth = f.email
+        ? `Basic ${btoa(`${f.email}:${f.token}`)}`
+        : `Bearer ${f.token}`
+      // Try direct first (works on same network); fallback to proxy
+      let data, ok
+      try {
+        const r = await fetch(url, { headers: { Authorization: auth, Accept: 'application/json' } })
+        ok = r.ok; data = await r.json()
+      } catch {
+        // CORS blocked — try via proxy
+        const r = await fetch('/api/jira', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ baseUrl: f.baseUrl, email: f.email, token: f.token, ticket: '_myself' }),
+        })
+        ok = r.status !== 500; data = await r.json()
+      }
+      if (ok && data.displayName) {
+        setTestResult({ ok: true, msg: `Connected as ${data.displayName}` })
+        saveJiraCfg(f)
+      } else {
+        setTestResult({ ok: false, msg: data.errorMessages?.[0] || data.message || 'Auth failed' })
+      }
+    } catch (e) {
+      setTestResult({ ok: false, msg: e.message })
+    } finally { setTesting(false) }
+  }
+
+  return (
+    <>
+      <div className="topbar"><h2>Jira Integration</h2></div>
+      <div className="content" style={{ maxWidth: 560 }}>
+        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 20, marginBottom: 16 }}>
+          <div style={{ fontSize: 13, color: 'var(--text2)', marginBottom: 16, lineHeight: 1.6 }}>
+            Connect to Jira to auto-fill epic and task fields from ticket numbers.
+            Credentials are stored locally in your browser only.
+          </div>
+          <div className="form-grid cols-1" style={{ gap: 12 }}>
+            <div className="form-group">
+              <label>Jira Base URL</label>
+              <input type="text" value={f.baseUrl} onChange={set('baseUrl')} placeholder="https://yourcompany.atlassian.net  or  https://jira.company.com/jira" />
+            </div>
+            <div className="form-group">
+              <label>Email / Username</label>
+              <input type="text" value={f.email} onChange={set('email')} placeholder="your@email.com  (leave blank to use Bearer token)" />
+            </div>
+            <div className="form-group">
+              <label>API Token / Password / PAT</label>
+              <input type="text" value={f.token} onChange={set('token')} placeholder="API token or personal access token" />
+            </div>
+          </div>
+          <div style={{ marginTop: 16, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button className="btn btn-primary" onClick={test} disabled={!f.baseUrl || !f.token || testing}>
+              {testing ? <Loader size={13} style={{ animation: 'spin 1s linear infinite' }} /> : <CheckCircle size={13} />}
+              {testing ? ' Testing…' : ' Test & Save'}
+            </button>
+            {jiraCfg && <button className="btn btn-ghost" onClick={() => { clearJiraCfg(); setF(blank); setTestResult(null) }}>Disconnect</button>}
+            {testResult && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: testResult.ok ? 'var(--green)' : 'var(--red)' }}>
+                {testResult.ok ? <CheckCircle size={14} /> : <XCircle size={14} />}
+                {testResult.msg}
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 20 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>How to get your API token</div>
+          <div style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.8 }}>
+            <b>Jira Cloud</b> (atlassian.net): Go to <code style={{ background: 'var(--bg3)', padding: '1px 5px', borderRadius: 3 }}>id.atlassian.com/manage-profile/security/api-tokens</code> → Create token.<br />
+            Enter your email + the token above.<br /><br />
+            <b>Jira Server / Data Center</b>: Go to your profile → Personal Access Tokens → Create.<br />
+            Leave Email blank and paste the PAT as the token.<br /><br />
+            <b>Internal servers</b>: The proxy runs from Netlify's servers. If your Jira is behind a
+            firewall/VPN, run <code style={{ background: 'var(--bg3)', padding: '1px 5px', borderRadius: 3 }}>netlify dev</code> locally so the proxy runs on your machine.
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
 
 // ─── helpers ───────────────────────────────────────────────────────────
 const STATUS_CLASS = {
@@ -70,11 +264,20 @@ const EPIC_STATUSES = ['In progress','To be Groomed','Completed','Partially rele
 const PRODUCT_AREAS = ['Activation','Delivery Layer','Optimization','Signal and Attribution','Observability','Analytics']
 const DETAIL_SHEETS = ['Bid Prediction Line Item','Activate-UI','AdServer( Delivery)','ML (Optimization)','CTR Tuning','Bid Landscape','Bidder ( Delivery)','Attribution and ID Consistency','Analytics','(none)']
 
-function EpicForm({ epic, onSave, onClose }) {
+function EpicForm({ epic, onSave, onClose, jiraCfg }) {
   const blank = { num:'', productArea:'', quarter:'', project:'', epicTicket:'', deliveryOwner:'', status:'To be Groomed', commentsOnProgress:'', completionPct:'', devStart:'', devComplete:'', qaStart:'', qaEnd:'', integrationTestingTicket:'', integrationTestingComplete:'', uatComplete:'', plannedReleaseDate:'', actualReleaseDate:'', generalComments:'' }
   const [f, setF] = useState(epic ? {...epic, completionPct: epic.completionPct != null ? Math.round(epic.completionPct*100) : ''} : blank)
   const set = k => e => setF(p => ({...p, [k]: e.target.value}))
   const save = () => onSave({...f, id: epic?.id || Date.now(), completionPct: f.completionPct !== '' ? parseFloat(f.completionPct)/100 : null })
+  const applyJira = fields => setF(p => ({
+    ...p,
+    ...(fields.project && { project: fields.project }),
+    ...(fields.status && { status: fields.status }),
+    ...(fields.deliveryOwner && { deliveryOwner: fields.deliveryOwner }),
+    ...(fields.plannedReleaseDate && { plannedReleaseDate: fields.plannedReleaseDate }),
+    ...(fields.generalComments && { generalComments: fields.generalComments }),
+    ...(fields.completionPct != null && { completionPct: Math.round(fields.completionPct * 100) }),
+  }))
   return (
     <>
       <div className="form-grid">
@@ -82,7 +285,11 @@ function EpicForm({ epic, onSave, onClose }) {
           <label>Epic / Project Name *</label>
           <input type="text" value={f.project} onChange={set('project')} placeholder="Project description..." />
         </div>
-        <div className="form-group"><label>EPIC Ticket</label><input type="text" value={f.epicTicket||''} onChange={set('epicTicket')} placeholder="APEX-000" /></div>
+        <div className="form-group">
+          <label>EPIC Ticket</label>
+          <input type="text" value={f.epicTicket||''} onChange={set('epicTicket')} placeholder="APEX-000" />
+          <div style={{marginTop:5}}><JiraFetchBtn ticket={f.epicTicket} onFetch={applyJira} jiraCfg={jiraCfg} mapFn={mapJiraToEpicFields} /></div>
+        </div>
         <div className="form-group"><label>Delivery Owner</label><input type="text" value={f.deliveryOwner||''} onChange={set('deliveryOwner')} /></div>
         <div className="form-group">
           <label>Product Area</label>
@@ -120,13 +327,40 @@ function EpicForm({ epic, onSave, onClose }) {
 }
 
 // ─── Epics Page ──────────────────────────────────────────────────────────
-function EpicsPage({ data, setData, onSelectEpic }) {
+function EpicsPage({ data, setData, onSelectEpic, jiraCfg }) {
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('All')
   const [filterArea, setFilterArea] = useState('All')
   const [filterQ, setFilterQ] = useState('All')
   const [showModal, setShowModal] = useState(false)
   const [editing, setEditing] = useState(null)
+  const [syncing, setSyncing] = useState(false)
+  const [syncResult, setSyncResult] = useState(null)
+
+  const syncAll = async () => {
+    if (!jiraCfg) return
+    setSyncing(true); setSyncResult(null)
+    let updated = 0, failed = 0
+    const epicsWithTickets = data.epics.filter(e => e.epicTicket)
+    for (const epic of epicsWithTickets) {
+      try {
+        const issue = await callJiraProxy(jiraCfg, epic.epicTicket)
+        const fields = mapJiraToEpicFields(issue)
+        setData(d => ({ ...d, epics: d.epics.map(e => e.id === epic.id ? {
+          ...e,
+          status: fields.status || e.status,
+          deliveryOwner: fields.deliveryOwner || e.deliveryOwner,
+          generalComments: fields.generalComments || e.generalComments,
+          plannedReleaseDate: fields.plannedReleaseDate || e.plannedReleaseDate,
+          completionPct: fields.completionPct != null ? fields.completionPct : e.completionPct,
+        } : e) }))
+        updated++
+      } catch { failed++ }
+    }
+    setSyncing(false)
+    setSyncResult(`Synced ${updated} epics${failed ? `, ${failed} failed` : ''}`)
+    setTimeout(() => setSyncResult(null), 4000)
+  }
 
   const epics = data.epics
   const statuses = ['All', ...new Set(epics.map(e => e.status).filter(Boolean))]
@@ -165,6 +399,13 @@ function EpicsPage({ data, setData, onSelectEpic }) {
     <>
       <div className="topbar">
         <h2>Epics & Projects</h2>
+        {jiraCfg && (
+          <button className="btn btn-ghost btn-sm" onClick={syncAll} disabled={syncing} title="Sync status from Jira for all epics with tickets">
+            {syncing ? <Loader size={13} style={{animation:'spin 1s linear infinite'}}/> : <RefreshCw size={13}/>}
+            {syncing ? ' Syncing…' : ' Sync All from Jira'}
+          </button>
+        )}
+        {syncResult && <span style={{fontSize:12,color:'var(--green)'}}>{syncResult}</span>}
         <button className="btn btn-primary btn-sm" onClick={() => { setEditing(null); setShowModal(true) }}><Plus size={14}/>Add Epic</button>
       </div>
       <div className="content">
@@ -239,7 +480,7 @@ function EpicsPage({ data, setData, onSelectEpic }) {
       </div>
       {showModal && (
         <Modal title={editing ? 'Edit Epic' : 'Add Epic'} onClose={()=>{setShowModal(false);setEditing(null)}}>
-          <EpicForm epic={editing} onSave={saveEpic} onClose={()=>{setShowModal(false);setEditing(null)}}/>
+          <EpicForm epic={editing} onSave={saveEpic} onClose={()=>{setShowModal(false);setEditing(null)}} jiraCfg={jiraCfg}/>
         </Modal>
       )}
     </>
@@ -250,16 +491,29 @@ function EpicsPage({ data, setData, onSelectEpic }) {
 const TASK_STATUSES = ['Planned','In Progress','Done','Released','Released ','To be started','In-Progress','Code Review','On Hold','NA','Blocked']
 const COMPONENTS = ['Bidder','ML','Analytics','Delivery','UI','UI-API','Backend API','UX','TW','Bidder/ML']
 
-function TaskForm({ task, sheetName, onSave, onClose }) {
+function TaskForm({ task, sheetName, onSave, onClose, jiraCfg }) {
   const blank = { releaseMilestone:'', epic:'', task:'', component:'', planningState:'Planned', sprintDev:'', sprintQA:'', devOwner:'', jira:'', devEstimates:'', devStartDate:'', devEndDate:'', qaEstimates:'', qaStartDate:'', qaEndDate:'', integrationTesting:'', uat:'', estimatedReleaseDate:'', dependencies:'' }
   const [f, setF] = useState(task || blank)
   const set = k => e => setF(p => ({...p, [k]: e.target.value}))
   const save = () => onSave({...f, id: task?.id || Date.now(), num: task?.num})
+  const applyJira = fields => setF(p => ({
+    ...p,
+    ...(fields.task && { task: fields.task }),
+    ...(fields.planningState && { planningState: fields.planningState }),
+    ...(fields.devOwner && { devOwner: fields.devOwner }),
+    ...(fields.estimatedReleaseDate && { estimatedReleaseDate: fields.estimatedReleaseDate }),
+    ...(fields.sprintDev && { sprintDev: fields.sprintDev }),
+    ...(fields.devEstimates && { devEstimates: fields.devEstimates }),
+  }))
   return (
     <>
       <div className="form-grid">
         <div className="form-group span-2"><label>Task *</label><textarea value={f.task||''} onChange={set('task')} style={{minHeight:50}} /></div>
-        <div className="form-group"><label>JIRA Ticket</label><input type="text" value={f.jira||''} onChange={set('jira')} placeholder="APEX-000" /></div>
+        <div className="form-group">
+          <label>JIRA Ticket</label>
+          <input type="text" value={f.jira||''} onChange={set('jira')} placeholder="APEX-000" />
+          <div style={{marginTop:5}}><JiraFetchBtn ticket={f.jira} onFetch={applyJira} jiraCfg={jiraCfg} mapFn={mapJiraToTaskFields} /></div>
+        </div>
         <div className="form-group"><label>Dev/QA Owner</label><input type="text" value={f.devOwner||''} onChange={set('devOwner')} /></div>
         <div className="form-group"><label>Epic</label><input type="text" value={f.epic||''} onChange={set('epic')} /></div>
         <div className="form-group"><label>Component</label><input type="text" value={f.component||''} onChange={set('component')} /></div>
@@ -291,7 +545,7 @@ function TaskForm({ task, sheetName, onSave, onClose }) {
   )
 }
 
-function EpicDetailPage({ epic, data, setData, onBack }) {
+function EpicDetailPage({ epic, data, setData, onBack, jiraCfg }) {
   const [showModal, setShowModal] = useState(false)
   const [editing, setEditing] = useState(null)
 
@@ -449,7 +703,7 @@ function EpicDetailPage({ epic, data, setData, onBack }) {
       </div>
       {showModal && (
         <Modal title={editing ? 'Edit Task' : 'Add Task'} onClose={()=>{setShowModal(false);setEditing(null)}} large>
-          <TaskForm task={editing} sheetName={activeSheet} onSave={saveTask} onClose={()=>{setShowModal(false);setEditing(null)}} />
+          <TaskForm task={editing} sheetName={activeSheet} onSave={saveTask} onClose={()=>{setShowModal(false);setEditing(null)}} jiraCfg={jiraCfg}/>
         </Modal>
       )}
     </>
@@ -729,6 +983,7 @@ function RisksPage({ data, setData }) {
 // ─── App Root ───────────────────────────────────────────────────────────
 export default function App() {
   const [data, setData] = useData()
+  const [jiraCfg, saveJiraCfg, clearJiraCfg] = useJiraConfig()
   const [page, setPage] = useState('epics')
   const [selectedEpic, setSelectedEpic] = useState(null)
 
@@ -777,6 +1032,16 @@ export default function App() {
             <span className="nav-badge">{data.risks.length}</span>
           </div>
         </div>
+        <div className="sidebar-section">
+          <div className="sidebar-section-label">Integrations</div>
+          <div className={`nav-item ${page==='jira'?'active':''}`} onClick={()=>nav('jira')}>
+            <Settings size={15}/>Jira
+            {jiraCfg
+              ? <span className="nav-badge" style={{background:'rgba(16,185,129,.2)',color:'#34d399'}}>●</span>
+              : <span className="nav-badge">—</span>
+            }
+          </div>
+        </div>
         <div className="sidebar-section" style={{marginTop:'auto',paddingTop:20}}>
           <div className="sidebar-section-label">Data</div>
           <div className="nav-item" onClick={exportData} style={{fontSize:12}}>Export JSON</div>
@@ -786,13 +1051,14 @@ export default function App() {
       </aside>
       <main className="main">
         {page === 'epics' && !selectedEpic && (
-          <EpicsPage data={data} setData={setData} onSelectEpic={e=>{setSelectedEpic(e);setPage('detail')}}/>
+          <EpicsPage data={data} setData={setData} jiraCfg={jiraCfg} onSelectEpic={e=>{setSelectedEpic(e);setPage('detail')}}/>
         )}
         {page === 'detail' && selectedEpic && (
-          <EpicDetailPage epic={data.epics.find(e=>e.id===selectedEpic.id)||selectedEpic} data={data} setData={setData} onBack={()=>{setPage('epics');setSelectedEpic(null)}}/>
+          <EpicDetailPage epic={data.epics.find(e=>e.id===selectedEpic.id)||selectedEpic} data={data} setData={setData} jiraCfg={jiraCfg} onBack={()=>{setPage('epics');setSelectedEpic(null)}}/>
         )}
         {page === 'milestones' && <MilestonesPage data={data} setData={setData}/>}
         {page === 'risks' && <RisksPage data={data} setData={setData}/>}
+        {page === 'jira' && <JiraSettingsPage jiraCfg={jiraCfg} saveJiraCfg={saveJiraCfg} clearJiraCfg={clearJiraCfg}/>}
       </main>
     </div>
   )
