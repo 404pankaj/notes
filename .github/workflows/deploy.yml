@@ -27,6 +27,8 @@ jobs:
         working-directory: plan-the-work
       - run: npm run build
         working-directory: plan-the-work
+        env:
+          VITE_BASE_PATH: /notes/
       - uses: actions/upload-pages-artifact@v3
         with:
           path: plan-the-work/dist
